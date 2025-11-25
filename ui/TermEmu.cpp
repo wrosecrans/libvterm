@@ -1,9 +1,175 @@
 #include "TermEmu.h"
 
+
+#include <QDebug>
 #include <QKeyEvent>
 #include <QPainter>
 #include <iostream>
 #include <format>
+
+#include <thread>
+
+#ifdef WIN32
+
+#include <Windows.h>
+#include <process.h>
+constexpr bool using_windows = true;
+
+
+class TermEmuWinPty {
+public:
+    HANDLE inputReadSide, outputWriteSide;
+    HANDLE outputReadSide, inputWriteSide;
+
+    HPCON hPC;
+
+    STARTUPINFOEXW startup_info;
+
+    TermEmuWinPty() {
+
+        if (!CreatePipe(&inputReadSide, &inputWriteSide, NULL, 0)) {
+            // return HRESULT_FROM_WIN32(GetLastError());
+            std::cout << "Failed to make inputWriteSide" << std::endl;
+
+        }
+
+        if (!CreatePipe(&outputReadSide, &outputWriteSide, NULL, 0)) {
+            // return HRESULT_FROM_WIN32(GetLastError());
+            std::cout << "Failed to make outputWriteSide" << std::endl;
+
+        }
+
+        auto result = CreatePseudoConsole({80, 24}, inputReadSide, outputWriteSide, 0, &hPC);
+        if (FAILED(result)) {
+            std::cout << "Failed to make Pseudoconsole" << std::endl;
+        }
+    }
+
+    ~TermEmuWinPty() {
+        ClosePseudoConsole(hPC);
+
+        CloseHandle(inputReadSide);
+        CloseHandle(outputWriteSide);
+        CloseHandle(outputReadSide);
+        CloseHandle(inputWriteSide);
+    }
+
+
+
+    HRESULT PrepareStartupInformation(HPCON hpc, STARTUPINFOEXW* psi)
+    {
+        // Prepare Startup Information structure
+        STARTUPINFOEXW si{0};
+        // ZeroMemory(&si, sizeof(si));
+        si.StartupInfo.cb = sizeof(STARTUPINFOEX);
+
+        // Discover the size required for the list
+        size_t bytesRequired;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &bytesRequired);
+
+        // Allocate memory to represent the list
+        si.lpAttributeList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, bytesRequired);
+        if (!si.lpAttributeList)
+        {
+            return E_OUTOFMEMORY;
+        }
+
+        // Initialize the list memory location
+        if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &bytesRequired))
+        {
+            HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+
+        // Set the pseudoconsole information into the list
+        if (!UpdateProcThreadAttribute(si.lpAttributeList,
+                                       0,
+                                       PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                       hpc,
+                                       sizeof(hpc),
+                                       NULL,
+                                       NULL))
+        {
+            HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+
+        *psi = si;
+
+        return S_OK;
+    }
+
+    void setupArguments(QProcess::CreateProcessArguments &args) {
+        // args.startupInfo.
+        args.flags |= EXTENDED_STARTUPINFO_PRESENT;
+        // args.startupInfo->hStdInput;
+
+        startup_info.StartupInfo = *(args.startupInfo);
+        args.startupInfo = (_STARTUPINFOW*)&startup_info;
+        PrepareStartupInformation(hPC, &startup_info);
+        std::cout << "Set up args\n";
+    }
+
+
+    void Listener() {
+        std::cout << "Starting listener\n";
+        constexpr int bufsize = 128;
+        char buffer[bufsize];
+        unsigned long bytes_read = 0;
+        while (1)
+        {
+            unsigned long avail = 0;
+            int idx = 0;
+            for (auto &p : {inputReadSide, outputReadSide}) { // outputWriteSide, , inputWriteSide}) {
+
+                auto peeked = PeekNamedPipe(p, 0, 0, 0, &avail, 0);
+                if(peeked == false) {
+                    auto E = GetLastError();
+                    std::cout << std::format("Peeked E {}, {}, {}. {}", E, idx%4, peeked, avail) << std::endl;
+
+                } else {
+                    if(avail > 0) {
+                        std::cout << std::format("Peeked {}, {}. {}", idx%4, peeked, avail) << std::endl;
+                    }
+                }
+
+                idx++;
+            }
+            // Read client requests from the pipe. This simplistic code only allows messages
+            // up to BUFSIZE characters in length.
+            /*      auto fSuccess = ReadFile(
+                outputReadSide,        // handle to pipe
+                buffer,    // buffer to receive data
+                bufsize, // size of buffer
+                &bytes_read, // number of bytes read
+                NULL);        // not overlapped I/O
+
+            if (!fSuccess || bytes_read == 0) {
+                if (GetLastError() == ERROR_BROKEN_PIPE) {
+                   // _tprintf(TEXT("InstanceThread: client disconnected.\n"));
+
+                } else {
+                   // _tprintf(TEXT("InstanceThread ReadFile failed, GLE=%d.\n"), GetLastError());
+                }
+                break;
+            }
+
+            std::string_view view(buffer, bytes_read);
+            std::cout << std::format("Reading pipe, got '{}'\n", view) << std::endl;
+*/
+        }
+    }
+
+};
+
+
+#else
+
+constexpr bool using_windows = false;
+
+#endif
+
+
 // int (*resize)(int rows, int cols, VTermStateFields *fields, void *user)
 int screen_resize(int rows, int cols, void *user) {
     std::cout << "Resize, \n" << std::endl;
@@ -44,12 +210,21 @@ static VTermStateCallbacks cb_state = {};
 
 TermEmu::TermEmu()
 {
+    connect(&timer, &QTimer::timeout, this, [&]() {
+        update();
+        // std::cout << "Timer" << std::endl;
+        timer.start(500);
+        draw_cursor = ! draw_cursor;
+    });
+    timer.start(100);
+
+
     // int rows = 25;  int cols = 80;
     term = vterm_new(term_h, term_w);
     vterm_set_utf8(term, true);
 
     screen = vterm_obtain_screen(term);
-    auto state = vterm_obtain_state(term);
+    state = vterm_obtain_state(term);
     vterm_screen_set_callbacks(screen, &cb_screen, this);
     // vterm_state_set_callbacks(state, &cb_state, this);
     /* vterm_output_set_callback(term, [](const char *s, size_t len, void *user) {
@@ -62,6 +237,82 @@ TermEmu::TermEmu()
     std::string msg = "Screen Startup\n";
     vterm_input_write(term, msg.c_str(), msg.size());
 
+    if(using_windows) {
+    //    Wpty = new TermEmuWinPty;
+    }
+
+
+
+    setFont(QFont("Consolas", 16));
+    P = new QProcess(this);
+    /* P->setCreateProcessArgumentsModifier([this](QProcess::CreateProcessArguments *args) {
+        Wpty->setupArguments(*args);
+        return;
+    }); */
+    connect(P, &QProcess::readyReadStandardOutput, [=]() {
+        auto ba = P->readAllStandardOutput();
+        qDebug() << ba.constData();
+        vterm_input_write(term, ba.constData(), ba.size());
+        update();
+    });
+
+    connect(P, &QProcess::errorOccurred, [=]() {
+        qDebug() << "ERROR " << P->errorString();
+
+    });
+
+
+    connect(P, &QProcess::readyReadStandardError, [=,this]() {
+        auto ba = P->readAllStandardError();
+        vterm_input_write(term, ba.constData(), ba.size());
+        update();
+        qDebug() << ba.constData();
+    });
+
+    connect(P, &QProcess::started, [=]() {
+        qDebug() << "Started!";
+    });
+
+    connect(P, &QProcess::stateChanged, [=]() {
+        auto ba = P->state();
+        qDebug() << "State changed " << ba;
+    });
+
+
+    // std::thread *t = new std::thread([this]() {
+    //     Wpty->Listener();
+    // });
+
+    //  P->start("python", {"-i", "-c", "print ('Hello cmdline')"}, QProcess::ReadWrite);
+
+    P->start("C:\\Users\\wrose\\Documents\\dev\\vcpkg\\downloads\\tools\\msys2\\d7266db249278763\\usr\\bin\\env.exe");
+
+    if( P->waitForStarted()) {
+        std::cout << "Yes\n";
+        P->write("print('Hello World')\n");
+    } else {
+        std::cout << "Nope\n";
+    }
+
+
+
+
+
+}
+
+TermEmu::~TermEmu()
+{
+    if(P) {
+        P->terminate();
+        auto b = P->waitForFinished(300);
+        if(!b) {
+            P->kill();
+            b = P->waitForFinished();
+        }
+        std::cout << std::format("Process killed {} \n", b);
+
+        delete P;
+    }
 }
 
 void TermEmu::keyPressEvent(QKeyEvent *event)
@@ -75,6 +326,13 @@ void TermEmu::keyPressEvent(QKeyEvent *event)
     auto k = VTERM_KEY_NONE;
 
     std::cout << std::format("2 TermEmu::keyPressEvent(),  str'{}'aft \n", text.toStdString()) << std::endl;
+
+
+    if(P) {
+        P->write(text.toStdString().c_str());
+        update();
+        // return;
+    }
 
     if (event->key() == Qt::Key_Up) {
         k = VTERM_KEY_UP;
@@ -133,6 +391,16 @@ void TermEmu::paintEvent(QPaintEvent *event)
         return;
     }
 
+    auto &f = font();
+    if (f == QFont()) {
+        qDebug() << "Default font " << f.family();
+        setFont(QFont("Consolas", 16));
+    }
+
+    auto metric = QFontMetrics(f);
+    auto char_w = metric.averageCharWidth();
+    auto char_h = metric.lineSpacing();
+
     std::string str;
     VTermRect v_rect{0, term_h, 0, term_w};
     vterm_screen_get_text(screen, str.data(), str.size(), v_rect);
@@ -140,24 +408,37 @@ void TermEmu::paintEvent(QPaintEvent *event)
     QPainter p(this);
     p.fillRect(rect(), QBrush(Qt::black));
     p.setPen(Qt::white);
-    p.setFont(QFont("Consolas", 16));
+    // p.setFont(QFont("Consolas", 16));
+    p.setFont(f);
 
 
     for(int row = 0; row < term_h; row++) {
         VTermRect rect{0, row, 0, term_w};
         vterm_screen_get_text(screen, str.data(), str.size(), v_rect);
-        p.drawText(0, (row+1) * 16, QString::fromStdString(str));
-        p.drawLine(0, row * 16, width(), row*16);
+        p.drawText(0, (row+1) * char_h, QString::fromStdString(str));
+        p.drawLine(0, row * char_h, width(), row*char_h);
         for(int column = 0; column < term_w; column++) {
             VTermScreenCell refCell{};
             VTermPos vtp{row, column};
             vterm_screen_get_cell(screen, vtp, &refCell);
             if(refCell.chars[0]) {
                 // std::cout << std::format("{}", (char)refCell.chars[0]);
-                p.drawText(16*column, 16*(row+1), QString::fromUcs4(refCell.chars, refCell.width));
+                p.drawText(char_w*column, char_h*(row+1), QString::fromUcs4(refCell.chars, refCell.width));
             }
 
         }
     }
+
+    VTermPos cursorpos{};
+    if(!state) {
+        return;
+    }
+    vterm_state_get_cursorpos(state, &cursorpos);
+    if(draw_cursor) {
+        p.setBrush(QColor::fromRgbF(.9, .8, .8, .8));
+    } else {
+        p.setBrush(QColor::fromRgbF(.2, .8, .8, .2));
+    }
+    p.drawRect(char_w * cursorpos.col, char_h * cursorpos.row, char_w, char_h);
 
 }
